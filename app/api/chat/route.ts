@@ -9,6 +9,10 @@ import { FlareChainManager } from './helpers/flareChainManager';
 import { TokenMetadataManager } from './helpers/tokensMetadataManager';
 import { TRANSFERS } from './types';
 import { classifyAndExtractEvents } from './helpers/eventsProcessor';
+// Add these imports
+import { FTSOService, FTSO_FEED_IDS } from '../../lib/flare/ftso';
+import { FDCService, ExternalChain, AttestationType } from '../../lib/flare/fdc';
+import { FAssetsService, detectFAssetTransaction } from '../../lib/flare/fassets';
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -202,7 +206,7 @@ async function checkFlareSpecificInteractions(analysis: any, provider: ethers.Js
           analysis.actionTypes.push('Potential FTSO Contract');
         }
         
-        if (code.includes('fasset') || code.includes('bridge')) {
+        if (code.includes('fasset' || code.includes('bridge'))) {
           analysis.flareSpecific.isFAssetsRelated = true;
           analysis.actionTypes.push('Potential FAssets Contract');
         }
@@ -806,6 +810,331 @@ export async function POST(request: NextRequest) {
           },
         }),
 
+        getFTSOPrice: tool({
+          description: 'Get real-time price from FTSO oracle for any supported trading pair',
+          parameters: z.object({
+            symbol: z.string().describe('Trading pair symbol like FLR/USD, BTC/USD, ETH/USD'),
+            chainId: z.number().describe('Flare network chain ID'),
+          }),
+          execute: async ({ symbol, chainId }) => {
+            try {
+              const provider = await flareChainManager.getProvider(chainId);
+              const ftsoService = new FTSOService(provider, chainId);
+              
+              const feedId = FTSO_FEED_IDS[symbol as keyof typeof FTSO_FEED_IDS];
+              if (!feedId) {
+                return {
+                  success: false,
+                  error: `Unsupported trading pair: ${symbol}`
+                };
+              }
+              
+              const priceData = await ftsoService.getPriceByFeedId(feedId);
+              
+              if (!priceData) {
+                return {
+                  success: false,
+                  error: 'Failed to fetch price data'
+                };
+              }
+              
+              return {
+                success: true,
+                data: JSON.stringify({
+                  symbol,
+                  price: priceData.formattedValue,
+                  rawValue: priceData.value,
+                  decimals: priceData.decimals,
+                  timestamp: new Date(priceData.timestamp * 1000).toISOString(),
+                  lastUpdate: `${Math.floor((Date.now() / 1000) - priceData.timestamp)} seconds ago`
+                })
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: (error as Error).message
+              };
+            }
+          },
+        }),
+        
+        calculateTransactionValueUSD: tool({
+          description: 'Calculate USD value of a transaction using FTSO price feeds',
+          parameters: z.object({
+            amount: z.string().describe('Amount of tokens'),
+            tokenSymbol: z.string().describe('Token symbol (FLR, ETH, BTC, etc)'),
+            chainId: z.number().describe('Chain ID'),
+          }),
+          execute: async ({ amount, tokenSymbol, chainId }) => {
+            try {
+              const provider = await flareChainManager.getProvider(chainId);
+              const ftsoService = new FTSOService(provider, chainId);
+              
+              const usdValue = await ftsoService.calculateUSDValue(amount, tokenSymbol);
+              
+              if (usdValue === null) {
+                return {
+                  success: false,
+                  error: `Could not calculate USD value for ${tokenSymbol}`
+                };
+              }
+              
+              return {
+                success: true,
+                data: JSON.stringify({
+                  amount,
+                  token: tokenSymbol,
+                  usdValue: usdValue.toFixed(2),
+                  formattedValue: `$${usdValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                })
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: (error as Error).message
+              };
+            }
+          },
+        }),
+        
+        verifyCrossChainTransaction: tool({
+          description: 'Verify a transaction on an external blockchain using Flare Data Connector (FDC)',
+          parameters: z.object({
+            chain: z.enum(['BTC', 'ETH', 'XRP', 'DOGE']).describe('External blockchain'),
+            txHash: z.string().describe('Transaction hash on the external chain'),
+            verifierChainId: z.number().describe('Flare network chain ID to use for verification'),
+          }),
+          execute: async ({ chain, txHash, verifierChainId }) => {
+            try {
+              const fdcService = new FDCService(verifierChainId);
+              
+              const txDetails = await fdcService.getCrossChainTransaction(
+                chain as ExternalChain,
+                txHash
+              );
+              
+              if (!txDetails) {
+                return {
+                  success: false,
+                  error: 'Transaction not found or verification failed'
+                };
+              }
+              
+              // Get attestation proof
+              const proof = await fdcService.getAttestationProof(
+                AttestationType.PAYMENT,
+                chain as ExternalChain,
+                { transactionHash: txHash }
+              );
+              
+              return {
+                success: true,
+                data: JSON.stringify({
+                  verified: true,
+                  chain,
+                  transaction: txDetails,
+                  attestation: {
+                    type: 'Payment',
+                    hasProof: !!proof,
+                    message: `Transaction verified by Flare Data Connector on ${chain}`
+                  }
+                })
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: (error as Error).message
+              };
+            }
+          },
+        }),
+        
+        getMultiChainBalance: tool({
+          description: 'Get wallet balances across multiple blockchains using FDC',
+          parameters: z.object({
+            address: z.string().describe('Wallet address'),
+            chains: z.array(z.enum(['BTC', 'ETH', 'XRP', 'DOGE'])).describe('List of chains to check'),
+            verifierChainId: z.number().describe('Flare network chain ID'),
+          }),
+          execute: async ({ address, chains, verifierChainId }) => {
+            try {
+              const fdcService = new FDCService(verifierChainId);
+              const balances: Record<string, any> = {};
+              
+              await Promise.all(
+                chains.map(async (chain) => {
+                  try {
+                    const balance = await fdcService.verifyBalance(
+                      chain as ExternalChain,
+                      address
+                    );
+                    
+                    balances[chain] = balance ? {
+                      balance: balance.balance,
+                      blockNumber: balance.blockNumber,
+                      verified: true
+                    } : {
+                      balance: '0',
+                      verified: false,
+                      error: 'Could not verify balance'
+                    };
+                  } catch (error) {
+                    balances[chain] = {
+                      balance: '0',
+                      verified: false,
+                      error: (error as Error).message
+                    };
+                  }
+                })
+              );
+              
+              return {
+                success: true,
+                data: JSON.stringify({
+                  address,
+                  balances,
+                  totalChains: chains.length,
+                  verifiedChains: Object.values(balances).filter((b: any) => b.verified).length
+                })
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: (error as Error).message
+              };
+            }
+          },
+        }),
+        
+        analyzeFAssetActivity: tool({
+          description: 'Analyze FAsset minting, redemption, and collateralization in a transaction',
+          parameters: z.object({
+            txHash: z.string().describe('Transaction hash'),
+            chainId: z.number().describe('Chain ID'),
+          }),
+          execute: async ({ txHash, chainId }) => {
+            try {
+              const provider = await flareChainManager.getProvider(chainId);
+              
+              // Check if transaction involves FAssets
+              const fassetCheck = await detectFAssetTransaction(provider, txHash, chainId);
+              
+              if (!fassetCheck.isFAssetTx) {
+                return {
+                  success: true,
+                  data: JSON.stringify({
+                    isFAssetTransaction: false,
+                    message: 'This transaction does not involve FAssets'
+                  })
+                };
+              }
+              
+              const service = new FAssetsService(provider, chainId);
+              const activity = await service.analyzeFAssetActivity(txHash);
+              
+              // Get FAsset info
+              const fassetInfo = fassetCheck.fassetType ? 
+                await service.getFAssetInfo(fassetCheck.fassetType) : null;
+              
+              return {
+                success: true,
+                data: JSON.stringify({
+                  isFAssetTransaction: true,
+                  fassetType: fassetCheck.fassetType,
+                  action: activity.type,
+                  amount: activity.amount,
+                  fassetInfo: fassetInfo ? {
+                    totalSupply: fassetInfo.totalSupply,
+                    collateralRatio: fassetInfo.collateralRatio,
+                    nativeAsset: fassetInfo.nativeAsset
+                  } : null,
+                  details: {
+                    agent: activity.agent,
+                    underlyingTransaction: activity.underlyingTx
+                  }
+                })
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: (error as Error).message
+              };
+            }
+          },
+        }),
+        
+        getFAssetsOverview: tool({
+          description: 'Get overview of all FAssets on the network including TVL and collateral ratios',
+          parameters: z.object({
+            chainId: z.number().describe('Chain ID'),
+          }),
+          execute: async ({ chainId }) => {
+            try {
+              const provider = await flareChainManager.getProvider(chainId);
+              const service = new FAssetsService(provider, chainId);
+              
+              const [fassets, tvl] = await Promise.all([
+                service.getAllFAssets(),
+                service.getTotalValueLocked()
+              ]);
+              
+              return {
+                success: true,
+                data: JSON.stringify({
+                  totalFAssets: fassets.length,
+                  tvlUSD: tvl.totalUSD,
+                  tvlBreakdown: tvl.breakdown,
+                  fassets: fassets.map(f => ({
+                    symbol: f.symbol,
+                    totalSupply: f.totalSupply,
+                    collateralRatio: f.collateralRatio,
+                    nativeAsset: f.nativeAsset,
+                    isActive: f.isActive
+                  })),
+                  averageCollateralRatio: fassets.length > 0 ?
+                    fassets.reduce((sum, f) => sum + f.collateralRatio, 0) / fassets.length : 0
+                })
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: (error as Error).message
+              };
+            }
+          },
+        }),
+        
+        fetchExternalAPIData: tool({
+          description: 'Fetch data from external Web2 APIs using FDC for verified data acquisition',
+          parameters: z.object({
+            apiUrl: z.string().describe('URL of the API to fetch data from'),
+            jsonPath: z.string().describe('JQ filter to extract specific data'),
+            chainId: z.number().describe('Chain ID'),
+          }),
+          execute: async ({ apiUrl, jsonPath, chainId }) => {
+            try {
+              const fdcService = new FDCService(chainId);
+              const data = await fdcService.fetchExternalAPIData(apiUrl, jsonPath);
+              
+              return {
+                success: true,
+                data: JSON.stringify({
+                  source: apiUrl,
+                  query: jsonPath,
+                  result: data,
+                  verifiedBy: 'Flare Data Connector',
+                  timestamp: new Date().toISOString()
+                })
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: (error as Error).message
+              };
+            }
+          },
+        }),
+
         // Fallback transaction analysis tool for any unsupported chains or edge cases
         secondaryFallbackAnalyzeTx: tool({
           description: 'A fallback tool if the main Flare analysis fails. This helps analyze blockchain transactions on any EVM chain with basic parsing.',
@@ -869,6 +1198,7 @@ export async function POST(request: NextRequest) {
           },
         }),
       },
+      
       temperature: 0.7,
       maxSteps: 20,
     });

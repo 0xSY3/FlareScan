@@ -3,7 +3,6 @@
 <div align="center">
   <img src="/public/FSlogo.svg" alt="FlareScanAI Logo" width="120" />
   <h3>The Most Comprehensive Cross-Chain Explorer Powered by Flare's Data Protocols</h3>
-  <p>Built for the Flare Hackathon 2024</p>
 </div>
 
 ## 🚀 Project Overview

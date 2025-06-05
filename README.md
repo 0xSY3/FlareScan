@@ -147,4 +147,3 @@ MIT License - see LICENSE file for details
 - Flare Network team for creating this incredible infrastructure
 - Flare developer community for their support and guidance
 - OpenAI for powering our intelligent analysis
-- All the coffee shops that kept us caffeinated during this hackathon ☕

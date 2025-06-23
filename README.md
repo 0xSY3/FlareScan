@@ -1,7 +1,7 @@
 # 🔥 FlareScanAI - AI-Powered Cross-Chain Explorer for Flare
 
 <div align="center">
-  <img src="/public/ss.png" alt="FlareScanAI Logo" width="120" />
+  <img src="/public/ss.png" alt="FlareScanAI Screenshot" width="800" />
   <h3>The Most Comprehensive Cross-Chain Explorer Powered by Flare's Data Protocols</h3>
 </div>
 
